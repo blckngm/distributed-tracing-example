@@ -1,43 +1,33 @@
-use std::time::Duration;
+use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::{Context as _, Result};
-use axum::{
-    http::{HeaderMap, HeaderValue},
-    routing::get,
-    Router,
-};
 use opentelemetry::{
     trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
     Context,
 };
+use tokio::net::UdpSocket;
 use tracing::{instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
 
-fn inject_context(cx: &Context, headers: &mut HeaderMap) {
+fn serialize_context(cx: &Context) -> [u8; 24] {
     let span = cx.span();
     let span_context = span.span_context();
-    if span_context.is_valid() {
-        headers.insert(
-            "my-trace-id",
-            HeaderValue::from_str(&format!(
-                "{}-{}",
-                span_context.trace_id(),
-                span_context.span_id(),
-            ))
-            .unwrap(),
-        );
-    };
+    let mut result = [0u8; 24];
+    result[..16].copy_from_slice(&span_context.trace_id().to_bytes());
+    result[16..].copy_from_slice(&span_context.span_id().to_bytes());
+    result
 }
 
-fn extract_context(headers: &HeaderMap) -> Option<SpanContext> {
-    let v = headers.get("my-trace-id")?.to_str().ok()?;
-    let mut parts = v.split('-');
-    let trace_id = parts.next()?;
-    let span_id = parts.next()?;
+fn deserialize_context(bytes: &[u8]) -> Option<SpanContext> {
+    if bytes.len() != 24 {
+        return None;
+    }
+    let trace_id = bytes[..16].try_into().unwrap();
+    let span_id = bytes[16..].try_into().unwrap();
     let span_cx = SpanContext::new(
-        TraceId::from_hex(trace_id).ok()?,
-        SpanId::from_hex(span_id).ok()?,
+        TraceId::from_bytes(trace_id),
+        SpanId::from_bytes(span_id),
         TraceFlags::SAMPLED,
         true,
         TraceState::default(),
@@ -46,8 +36,8 @@ fn extract_context(headers: &HeaderMap) -> Option<SpanContext> {
 }
 
 #[instrument]
-async fn handler(headers: HeaderMap) -> &'static str {
-    let cx = if let Some(span_cx) = extract_context(&headers) {
+async fn consume(msg: &[u8]) {
+    let cx = if let Some(span_cx) = deserialize_context(&msg) {
         Context::current().with_remote_span_context(span_cx)
     } else {
         Context::current()
@@ -56,37 +46,30 @@ async fn handler(headers: HeaderMap) -> &'static str {
     Span::current().set_parent(cx);
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-
-    "ok"
 }
 
-async fn run_server() -> Result<()> {
-    let app = Router::new().route("/", get(handler));
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(app.into_make_service())
-        .await?;
-    Ok(())
+async fn run_consumer() -> Result<()> {
+    let sock = UdpSocket::bind("127.0.0.1:3000").await?;
+    let mut buf = [0u8; 24];
+    loop {
+        let (len, _) = sock.recv_from(&mut buf).await?;
+        consume(&buf[..len]).await;
+    }
 }
 
 #[instrument]
-async fn req() -> Result<()> {
-    let mut headers = HeaderMap::new();
-
+async fn produce(sock: &UdpSocket) -> Result<()> {
     let cx = Span::current().context();
-    inject_context(&cx, &mut headers);
-
-    let c = reqwest::Client::new();
-    c.get("http://127.0.0.1:3000")
-        .headers(headers)
-        .send()
-        .await?;
+    let msg = serialize_context(&cx);
+    sock.send_to(&msg, (Ipv4Addr::LOCALHOST, 3000)).await?;
     Ok(())
 }
 
 #[instrument]
-async fn run_client() -> Result<()> {
+async fn produce_many() -> Result<()> {
+    let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     for _ in 0..10 {
-        req().await?;
+        produce(&sock).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     Ok(())
@@ -94,13 +77,13 @@ async fn run_client() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let is_server = std::env::args().nth(1).context("command")? == "server";
+    let is_consumer = std::env::args().nth(1).context("command")? == "consumer";
     let _guard = init_tracing()?;
 
-    if is_server {
-        run_server().await?;
+    if is_consumer {
+        run_consumer().await?;
     } else {
-        run_client().await?;
+        produce_many().await?;
     }
     Ok(())
 }
