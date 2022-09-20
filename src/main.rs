@@ -2,10 +2,13 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::{Context as _, Result};
 use opentelemetry::{
+    sdk::{trace, Resource},
     trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
-    Context,
+    Context, KeyValue,
 };
+use opentelemetry_otlp::WithExportConfig;
 use tokio::net::UdpSocket;
+use tonic::metadata::{AsciiMetadataKey, MetadataMap};
 use tracing::{instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
@@ -37,7 +40,7 @@ fn deserialize_context(bytes: &[u8]) -> Option<SpanContext> {
 
 #[instrument]
 async fn consume(msg: &[u8]) {
-    let cx = if let Some(span_cx) = deserialize_context(&msg) {
+    let cx = if let Some(span_cx) = deserialize_context(msg) {
         Context::current().with_remote_span_context(span_cx)
     } else {
         Context::current()
@@ -104,16 +107,48 @@ pub fn init_tracing() -> anyhow::Result<ShutdownGuard> {
         .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .with(env_filter_layer);
 
-    let jaeger_layer = {
+    let otlp_layer = {
         let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "godwoken".into());
-        let tracer = opentelemetry_jaeger::new_pipeline()
-            .with_service_name(service_name)
-            .with_auto_split_batch(true)
-            .install_batch(opentelemetry::runtime::Tokio)?;
+        let mut meta = MetadataMap::with_capacity(1);
+        let kvs = std::env::var("OTEL_EXPORTER_OTLP_HEADERS").unwrap_or_else(|_| "".into());
+        for kv in kvs.split(',') {
+            let mut kv = kv.splitn(2, '=');
+            if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                meta.insert(
+                    match k.parse::<AsciiMetadataKey>() {
+                        Ok(k) => k,
+                        _ => {
+                            eprintln!("OTEL_EXPORTER_OTLP_HEADERS: invalid header key: {k}");
+                            continue;
+                        }
+                    },
+                    match v.parse() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            eprintln!("OTEL_EXPORTER_OTLP_HEADERS: invalid header value: {v}");
+                            continue;
+                        }
+                    },
+                );
+            }
+        }
+        let tracer =
+            opentelemetry_otlp::new_pipeline()
+                .tracing()
+                .with_exporter(
+                    opentelemetry_otlp::new_exporter()
+                        .tonic()
+                        .with_env()
+                        .with_metadata(meta),
+                )
+                .with_trace_config(trace::config().with_resource(Resource::new(vec![
+                    KeyValue::new("service.name", service_name),
+                ])))
+                .install_batch(opentelemetry::runtime::Tokio)?;
         tracing_opentelemetry::layer().with_tracer(tracer)
     };
 
-    registry.with(jaeger_layer).try_init()?;
+    registry.with(otlp_layer).try_init()?;
 
     Ok(ShutdownGuard)
 }
