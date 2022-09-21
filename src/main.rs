@@ -1,93 +1,44 @@
-use std::{net::Ipv4Addr, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use opentelemetry::{
-    sdk::{trace, Resource},
-    trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
-    Context, KeyValue,
+use axum::{
+    http::{HeaderMap, StatusCode},
+    routing::get,
+    Router,
 };
+use opentelemetry::{
+    global,
+    sdk::{propagation::TraceContextPropagator, trace, Resource},
+    KeyValue,
+};
+use opentelemetry_http::HeaderExtractor;
 use opentelemetry_otlp::WithExportConfig;
-use tokio::net::UdpSocket;
 use tonic::metadata::{AsciiMetadataKey, MetadataMap};
-use tracing::{instrument, Span};
+use tracing::instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{prelude::*, util::SubscriberInitExt};
 
-fn serialize_context(cx: &Context) -> [u8; 24] {
-    let span = cx.span();
-    let span_context = span.span_context();
-    let mut result = [0u8; 24];
-    result[..16].copy_from_slice(&span_context.trace_id().to_bytes());
-    result[16..].copy_from_slice(&span_context.span_id().to_bytes());
-    result
-}
+#[instrument(skip(headers))]
+async fn handle_get_index(headers: HeaderMap) -> StatusCode {
+    let cx = global::get_text_map_propagator(|p| p.extract(&HeaderExtractor(&headers)));
+    tracing::Span::current().set_parent(cx);
 
-fn deserialize_context(bytes: &[u8]) -> Option<SpanContext> {
-    if bytes.len() != 24 {
-        return None;
-    }
-    let trace_id = bytes[..16].try_into().unwrap();
-    let span_id = bytes[16..].try_into().unwrap();
-    let span_cx = SpanContext::new(
-        TraceId::from_bytes(trace_id),
-        SpanId::from_bytes(span_id),
-        TraceFlags::SAMPLED,
-        true,
-        TraceState::default(),
-    );
-    Some(span_cx)
-}
+    tracing::info!("handling get request");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    tracing::error!("error message");
 
-#[instrument]
-async fn consume(msg: &[u8]) {
-    let cx = if let Some(span_cx) = deserialize_context(msg) {
-        Context::current().with_remote_span_context(span_cx)
-    } else {
-        Context::current()
-    };
-
-    Span::current().set_parent(cx);
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-}
-
-async fn run_consumer() -> Result<()> {
-    let sock = UdpSocket::bind("127.0.0.1:3000").await?;
-    let mut buf = [0u8; 24];
-    loop {
-        let (len, _) = sock.recv_from(&mut buf).await?;
-        consume(&buf[..len]).await;
-    }
-}
-
-#[instrument]
-async fn produce(sock: &UdpSocket) -> Result<()> {
-    let cx = Span::current().context();
-    let msg = serialize_context(&cx);
-    sock.send_to(&msg, (Ipv4Addr::LOCALHOST, 3000)).await?;
-    Ok(())
-}
-
-#[instrument]
-async fn produce_many() -> Result<()> {
-    let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    for _ in 0..10 {
-        produce(&sock).await?;
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    Ok(())
+    StatusCode::NO_CONTENT
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let is_consumer = std::env::args().nth(1).context("command")? == "consumer";
+    dotenv::dotenv().context("dotenv")?;
     let _guard = init_tracing()?;
 
-    if is_consumer {
-        run_consumer().await?;
-    } else {
-        produce_many().await?;
-    }
+    let app = Router::new().route("/", get(handle_get_index));
+    axum::Server::bind(&"127.0.0.1:3001".parse().unwrap())
+        .serve(app.into_make_service())
+        .await?;
     Ok(())
 }
 
@@ -100,6 +51,8 @@ impl Drop for ShutdownGuard {
 }
 
 pub fn init_tracing() -> anyhow::Result<ShutdownGuard> {
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
     let env_filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))?;
 
